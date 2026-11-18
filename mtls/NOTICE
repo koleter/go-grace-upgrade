@@ -1,0 +1,16 @@
+This directory contains a modified copy of the MOSN TLS implementation from:
+  arch_wcloud_mosn/pkg/mtls/crypto/tls
+  source revision 6ad3ed5affa7f8af8157733c74295ba4b00e6632
+
+The implementation originated in Go 1.12.7 crypto/tls, under the Go Authors'
+BSD license (LICENSE). MOSN additions carry Apache-2.0 headers (LICENSE-MOSN).
+Those original headers and licenses are preserved. The root MIT license does
+not replace the licenses of these files.
+
+Local changes include post-handshake TLS 1.2 key capture, TLS 1.3 enabled by
+default, TLS 1.2 minimum default, and non-destructive, versioned TLS 1.2/1.3
+snapshots and restoration including record buffers and authentication state.
+The BabaSSL-specific C/GM integration has not been imported.
+
+The unused legacy TransferTLSConn/GetTLSInfo and MOSN-specific connection
+mutation helpers have been removed; Snapshot/Restore is the sole migration API.

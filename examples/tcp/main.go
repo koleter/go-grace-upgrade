@@ -1,7 +1,8 @@
 //go:build linux || darwin
 
-// A TCP line service. Start a new version with the same -upgrade-socket to
-// migrate the listener, existing connections, partial lines and session counts.
+// A TCP service with #-delimited requests and line-delimited responses. Start a
+// new version with the same -upgrade-socket to migrate existing connections,
+// partial messages and session counts.
 package main
 
 import (
@@ -42,6 +43,14 @@ func run() error {
 	if *mode != "server" {
 		return errors.New("mode must be server or client")
 	}
+	decoder, err := graceupgrade.DelimiterDecoder("#")
+	if err != nil {
+		return err
+	}
+	encoder, err := graceupgrade.DelimiterEncoder("\n")
+	if err != nil {
+		return err
+	}
 	manager, err := graceupgrade.New(graceupgrade.Options{
 		UpgradeSocket:  *socket,
 		OnUpgradeError: func(err error) { log.Printf("upgrade failed: %v", err) },
@@ -50,8 +59,9 @@ func run() error {
 		return err
 	}
 	defer manager.Close()
-	server, err := manager.NewServer("tcp", "tcp", *address, graceupgrade.ServerOptions{
-		Codec: graceupgrade.LineCodec(),
+	server, err := manager.NewServer("test-tcp", "tcp", *address, graceupgrade.ServerOptions{
+		Decoder: decoder,
+		Encoder: encoder,
 		OnMessage: func(ctx context.Context, session *graceupgrade.Session, message []byte) ([]byte, error) {
 			return json.Marshal(map[string]any{
 				"pid": os.Getpid(), "version": version,
@@ -103,7 +113,7 @@ func runClient(address string, interval time.Duration) error {
 	defer ticker.Stop()
 	for count := 1; ; count++ {
 		conn.SetDeadline(time.Now().Add(30 * time.Second))
-		if _, err := fmt.Fprintf(conn, "message-%d\n", count); err != nil {
+		if _, err := fmt.Fprintf(conn, "message-%d#", count); err != nil {
 			return err
 		}
 		line, err := reader.ReadString('\n')

@@ -32,6 +32,14 @@ func handleMessage(ctx context.Context, session *graceupgrade.Session, message [
 }
 
 func runServer(o options) error {
+	decoder, err := graceupgrade.DelimiterDecoder("\n")
+	if err != nil {
+		return err
+	}
+	encoder, err := graceupgrade.DelimiterEncoder("\n")
+	if err != nil {
+		return err
+	}
 	manager, err := graceupgrade.New(graceupgrade.Options{
 		ReadyTimeout: o.readyTimeout, UpgradeSocket: o.upgradeSocket,
 		OnUpgradeError: func(err error) { log.Printf("upgrade failed; original connections resumed: %v", err) },
@@ -45,7 +53,8 @@ func runServer(o options) error {
 		return fmt.Errorf("load TLS certificate (generate with -mode cert): %w", err)
 	}
 	server, err := manager.NewServer("tls-echo", "tcp", o.address, graceupgrade.ServerOptions{
-		Codec:     graceupgrade.LineCodec(),
+		Decoder:   decoder,
+		Encoder:   encoder,
 		OnMessage: handleMessage,
 		TLSConfig: &mtls.Config{
 			Certificates: []mtls.Certificate{certificate},

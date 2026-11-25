@@ -130,6 +130,10 @@ func run() error {
 }
 
 func exercise(dir string, binaries map[string]string, test scenario, options exampleOptions) (result error) {
+	requestDelimiter := "\n"
+	if options.path == "./examples/tcp" {
+		requestDelimiter = "#"
+	}
 	if err := os.Mkdir(dir, 0700); err != nil {
 		return err
 	}
@@ -231,7 +235,7 @@ func exercise(dir string, binaries map[string]string, test scenario, options exa
 	}
 	exchange := func(text string) (reply, error) {
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if _, err := fmt.Fprintln(conn, text); err != nil {
+		if _, err := io.WriteString(conn, text+requestDelimiter); err != nil {
 			return reply{}, err
 		}
 		return read()
@@ -246,7 +250,7 @@ func exercise(dir string, binaries map[string]string, test scenario, options exa
 	if err := install("v2"); err != nil {
 		return err
 	}
-	prefix, suffix, payload := "partial", "-after\n", "partial-after"
+	prefix, suffix, payload := "partial", "-after"+requestDelimiter, "partial-after"
 	if _, err := io.WriteString(conn, prefix); err != nil {
 		return err
 	}
@@ -334,7 +338,7 @@ func exercise(dir string, binaries map[string]string, test scenario, options exa
 	}
 	defer fresh.Close()
 	fresh.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := fmt.Fprintln(fresh, "fresh"); err != nil {
+	if _, err := io.WriteString(fresh, "fresh"+requestDelimiter); err != nil {
 		return err
 	}
 	data, err := bufio.NewReader(fresh).ReadBytes('\n')

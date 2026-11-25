@@ -7,8 +7,9 @@
 // After handoff, Manager.Done closes. With managed HTTP servers, use Manager.Wait
 // to wait for request draining before cleaning up and exiting the old process.
 //
-// NewServer with Codec and OnMessage provides framing and automatic Session
-// migration. Applications can implement the Codec interface for custom formats.
+// NewServer with Decoder, OnMessage and optional Encoder provides independent
+// inbound/outbound framing and automatic Session migration. Without an Encoder,
+// responses are sent unchanged.
 // ServeHTTP manages a standard http.Server, automatically draining it after
 // handoff or Close. Connections accepted through a bare Listen stay
 // application-owned and must be drained.

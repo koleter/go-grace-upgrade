@@ -16,10 +16,12 @@ import (
 const maxBufferSize = 256 << 10
 
 type ServerOptions struct {
-	// OnMessage handles complete messages using Codec. Both are required;
+	// OnMessage handles complete messages from Decoder. Both are required;
 	// the framework snapshots and restores Session automatically.
 	OnMessage MessageHandler
-	Codec     Codec
+	Decoder   Decoder
+	// Encoder formats outbound responses, default RawEncoder (send unchanged).
+	Encoder   Encoder
 	TLSConfig *mtls.Config
 	// Listen optionally creates the raw TCP listener on cold start only. An
 	// upgrading process claims the inherited listener without calling it.
@@ -50,7 +52,7 @@ type Server struct {
 
 var nextConnectionID atomic.Uint64
 
-// NewServer registers a listener with Codec and OnMessage.
+// NewServer registers a listener with Decoder, OnMessage and optional Encoder.
 // Register and Serve it before Manager.Ready in every generation. Use this API
 // on the first generation too; existing unmanaged net.Conn/crypto/tls.Conn
 // instances cannot be retroactively captured.

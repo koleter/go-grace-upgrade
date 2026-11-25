@@ -71,7 +71,7 @@ func run() error {
 		})
 	})
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	if err := m.ServeHTTP("http", "tcp", *addr, server, graceupgrade.HTTPOptions{DrainTimeout: *drainTimeout}); err != nil {
+	if err := m.ServeHTTP("test-http", "tcp", *addr, server, graceupgrade.HTTPOptions{DrainTimeout: *drainTimeout}); err != nil {
 		return err
 	}
 	if err := m.Ready(context.Background()); err != nil {

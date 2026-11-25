@@ -28,20 +28,16 @@ import (
 	mtls "github.com/koleter/go-grace-upgrade/mtls"
 )
 
-// counterCodec demonstrates a business-defined Codec: line-framed requests,
-// with response framing supplied by the callback (including raw large replies).
-type counterCodec struct{}
+// counterDecoder demonstrates business-defined inbound framing, with response
+// framing supplied by the callback (including raw large replies).
+type counterDecoder struct{ Decoder }
 
-func (counterCodec) Name() string { return "test/counter/v1" }
-func (counterCodec) Decode(input []byte) (int, []byte, error) {
-	return LineCodec().Decode(input)
-}
-func (counterCodec) Encode(message []byte) ([]byte, error) { return message, nil }
+func (counterDecoder) Name() string { return "test/counter/v1" }
 
 func counterOptions(t *testing.T, version, suite uint16) ServerOptions {
 	t.Helper()
 	return ServerOptions{
-		Codec: counterCodec{}, TLSConfig: managedTLSConfig(t, version, suite),
+		Decoder: counterDecoder{Decoder: testDelimiterDecoder(t, "\n")}, TLSConfig: managedTLSConfig(t, version, suite),
 		OnMessage: func(ctx context.Context, session *Session, data []byte) ([]byte, error) {
 			if string(data) == "large" {
 				return bytes.Repeat([]byte("Z"), 192<<10), nil
@@ -93,7 +89,7 @@ func TestManagedChild(t *testing.T) {
 	}
 	options := counterOptions(t, uint16(version), uint16(suite))
 	if os.Getenv("GRACEUPGRADE_REJECT_RESTORE") == "1" {
-		options.Codec = renamedCodec{Codec: options.Codec, name: "incompatible/v2"}
+		options.Decoder = renamedDecoder{Decoder: options.Decoder, name: "incompatible/v2"}
 	}
 	if os.Getenv("GRACEUPGRADE_REJECT_RESTORE") == "second" {
 		options.MaxBuffer = 1024

@@ -15,7 +15,7 @@
 | 升级协调 | 通过监听/连接迁移 domain socket 协调，可分进程启动 | 新实例通过配置的 UDS 主动发现旧实例并接管，只有这一种升级入口 |
 | 连接交接 | 支持迁移的协议在读循环中逐连接交接 | 暂停托管连接，整批恢复后提交；恢复失败整批回退 |
 | 未完成请求 | 可把旧进程后续收到的上游响应按新连接 ID 转发给新进程 | 等待当前业务回调完成，再交接待发送响应；不实现旧进程残留响应转发 |
-| 半包 | 网络层共享 IoBuffer，codec 完整消费后 Drain，未消费字节迁移 | Codec 仅返回完整消息，未消费字节始终留在框架缓冲中 |
+| 半包 | 网络层共享 IoBuffer，codec 完整消费后 Drain，未消费字节迁移 | Decoder 仅返回完整消息，未消费字节始终留在框架缓冲中 |
 | 业务会话 | 不自动迁移任意业务对象 | 框架自动迁移 Session，业务状态保存到 Session.Values |
 | HTTP/1.1 | 本地参考版本禁用连接迁移，使用 Connection: close 排空 | ServeHTTP 自动调用标准 net/http.Server.Shutdown 排空，不自实现 HTTP 解析器 |
 | HTTP/2 | 本地参考版本禁用连接迁移，走 GOAWAY/GracefulShutdown | 不支持 HTTP/2 原连接迁移 |
@@ -24,9 +24,9 @@
 
 ## 低成本接入自定义 TCP/TLS
 
-使用 `ServerOptions{Codec: ..., OnMessage: ...}`，两项均为必填。业务提供完整消息处理函数；常见 LF/长度前缀格式可以直接使用内置 Codec。自定义格式实现 Codec 接口的 Name、Decode、Encode 方法，只描述拆包和编码，不持有每连接解析状态。Name 标识协议版本及配置，升级时用于兼容性校验。
+使用 `ServerOptions{Decoder: ..., OnMessage: ..., Encoder: ...}`，Decoder 和 OnMessage 必填，Encoder 默认 RawEncoder，原样发送响应。入站可用 `DelimiterDecoder("#")` 拆包，出站独立选择 `DelimiterEncoder("\n")` 或默认透传；长度前缀格式分别使用 `LengthPrefixDecoder(width)` 和 `LengthPrefixEncoder(width)`。自定义格式分别实现 Decoder/Encoder 接口，只描述拆包或编码，不持有每连接解析状态。两个 Name 分别标识协议版本及配置，升级时同时校验任一方向是否变化。
 
-框架自动保存消息序号和 Session.Values。回调在每连接中串行执行，升级在回调边界暂停；回调仍在执行时不会从另一进程重放。超时取消升级，不会强制把业务执行到一半的状态交给新进程。任意业务对象需要主动映射到 Session.Values，Codec 实例本身不会被迁移。
+框架自动保存消息序号和 Session.Values。回调在每连接中串行执行，升级在回调边界暂停；回调仍在执行时不会从另一进程重放。超时取消升级，不会强制把业务执行到一半的状态交给新进程。任意业务对象需要主动映射到 Session.Values，Decoder/Encoder 实例本身不会被迁移。
 
 监听 socket 可以由 ServerOptions.Listen 或 Manager.ListenWith 的创建函数提供，首次启动才调用，升级时按名称认领继承资源。TLS 必须由本模块的 TLSConfig 管理。
 

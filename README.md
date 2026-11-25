@@ -9,6 +9,11 @@ Go 服务的 UDS 热升级模块，支持 Linux / macOS，使用 Go 1.25.11。�
 ## 接入自定义 TCP/TLS
 
 ```go
+decoder, err := graceupgrade.DelimiterDecoder("#") // 入站：按 # 拆包
+if err != nil { return err }
+encoder, err := graceupgrade.DelimiterEncoder("\n") // 出站：追加换行
+if err != nil { return err }
+
 manager, err := graceupgrade.New(graceupgrade.Options{
     UpgradeSocket: "/tmp/my-service.sock", // 每一代保持相同路径，父目录须已存在
     ReadyTimeout: 15 * time.Second,
@@ -17,7 +22,8 @@ if err != nil { return err }
 defer manager.Close()
 
 server, err := manager.NewServer("service", "tcp", ":9090", graceupgrade.ServerOptions{
-    Codec: graceupgrade.LineCodec(),
+    Decoder: decoder,
+    Encoder: encoder, // 省略则原样发送 OnMessage 返回的字节
     OnMessage: func(ctx context.Context, session *graceupgrade.Session, message []byte) ([]byte, error) {
         return []byte(fmt.Sprintf("reply-%d: %s", session.Sequence, message)), nil
     },
@@ -31,25 +37,39 @@ if err := manager.Ready(ctx); err != nil { return err }
 // 所有托管连接已经交接，清理应用资源并返回 main。
 ```
 
-`Codec` 是业务可自行实现的接口，只描述消息格式，框架统一管理缓冲和 socket I/O。内置 `LineCodec()`（LF 分隔）及 `LengthPrefixCodec(width)`（1/2/4/8 字节大端长度前缀）。自定义格式实现以下接口后，直接赋给 `ServerOptions.Codec`：
+消息处理借鉴 [Netty Pipeline 的入站/出站分离](https://netty.io/4.1/api/io/netty/channel/ChannelPipeline.html)，流程为 `网络输入 → Decoder → OnMessage → Encoder → 网络输出`。业务分别配置收包格式、处理函数和回包格式，框架统一管理缓冲和 socket I/O。
+
+`Decoder` 和 `OnMessage` 必填，`Encoder` 可选，默认 `RawEncoder()`：直接发送业务返回的字节，不追加任何内容。例如接收 `hello#world#` 时，业务依次收到 `hello` 和 `world`；使用 `DelimiterEncoder("\n")` 时响应追加换行，省略 Encoder 时直接返回原始响应。业务也可以在 OnMessage 中组装完整回包，包括换行，然后使用默认原样发送。原样发送时，接收端需按自身协议识别响应边界。
+
+`DelimiterDecoder(delimiter)` 按原始字节精确匹配并去掉包尾分隔符，例如 `"#"`、`"\r\n"`、`"<END>"` 或中文字符串。支持粘包和分隔符本身被拆开的半包；请求分隔符不限制响应内容，按 `#` 收包时响应可以包含 `#`。
+
+`DelimiterEncoder(delimiter)` 只负责出站的分隔符封装。它不执行转义：响应正文包含出站分隔符，或正文尾部与追加的分隔符形成更早的匹配时，编码返回错误，避免客户端误拆包。非 nil 空响应编码为单独的分隔符。两种分隔符构造函数都返回 `(接口, error)`，分隔符不能为空；完整包（含分隔符）不能超过 `MaxBuffer`，最多 256 KiB。
+
+自定义格式只需实现所需方向的接口，分别赋给 `ServerOptions.Decoder` 和 `ServerOptions.Encoder`：
 
 ```go
-type Codec interface {
+type Decoder interface {
     Name() string
     Decode(input []byte) (consumed int, message []byte, err error)
+}
+
+type Encoder interface {
+    Name() string
     Encode(message []byte) ([]byte, error)
 }
 ```
 
-`Name()` 标识协议格式、配置及版本，长度为 1–256 字节，在服务运行期间保持稳定；升级前后必须一致，不兼容时回退旧实例。`Decode` 每次只返回一个完整消息及其占用的字节数，半包返回 `0, nil, nil`，不提前消费输入或保存连接私有解析状态。`Encode` 为响应正文添加协议封装。同一 Codec 实例会被不同连接并发调用，方法必须并发安全，不能保存输入切片。
+`Name()` 标识各自方向的协议格式、配置及版本，长度为 1–256 字节，在服务运行期间保持稳定。热升级同时校验 Decoder 和 Encoder，任一侧改变时拒绝恢复并回退旧实例。`Decode` 每次只返回一个完整消息及其占用的字节数，半包返回 `0, nil, nil`，不提前消费输入或保存连接私有解析状态。`Encode` 只处理响应。实例会被不同连接并发调用，方法必须并发安全，不能保存输入切片或连接私有状态。
 
-`OnMessage` 收到完整消息，返回响应正文，框架负责编码和发送。返回 nil 表示不响应，非 nil 空切片表示发送空消息。同一连接的回调串行执行；不同连接可以并行。
+长度前缀格式分别使用 `LengthPrefixDecoder(width)` 和 `LengthPrefixEncoder(width)`，支持 1/2/4/8 字节大端无符号长度，长度不包含前缀本身。各方向的构造函数独立使用，也可以搭配不同格式。按行收发使用 `DelimiterDecoder("\n")` 配合 `DelimiterEncoder("\n")`。双向协议标识不变时，会话快照保持兼容；默认 Encoder 和显式 `RawEncoder()` 也可相互恢复。
+
+`OnMessage` 收到完整消息，返回响应正文，框架交给 Encoder 后发送。返回 nil 表示不响应且不调用 Encoder，非 nil 空切片仍会调用 Encoder；使用 RawEncoder 时空响应不产生网络字节。同一连接的回调串行执行；不同连接可以并行。
 
 `Session.Sequence` 自动递增。需要保留认证用户等小量会话数据时，写入 `Session.Values`，例如 `session.Values["user"] = []byte(userID)`。不要修改 Sequence，不要在回调外访问 Session，也不要保存输入切片；需要保留时先复制。
 
-`Codec` 和 `OnMessage` 均为必填项。每连接需要迁移的业务状态应保存到 `Session.Values`，由框架统一快照和恢复；Codec 实例本身不会被迁移。
+每连接需要迁移的业务状态应保存到 `Session.Values`，由框架统一快照和恢复；Decoder/Encoder 实例本身不会被迁移。
 
-原 `Factory` 接入需要将协议编解码迁移到 Codec、业务处理迁移到 OnMessage、会话状态迁移到 Session.Values。旧自定义 Handler 快照不能直接恢复为 Session，升级时会拒绝并回退旧实例。
+原 `Factory` 接入需要将协议解码迁移到 Decoder、响应编码迁移到 Encoder、业务处理迁移到 OnMessage、会话状态迁移到 Session.Values。旧自定义 Handler 快照不能直接恢复为 Session，升级时会拒绝并回退旧实例。
 
 业务需要配置 socket 选项时，可通过 `ServerOptions.Listen` 提供原始 `*net.TCPListener` 创建函数。只在冷启动时调用，升级实例会自动认领继承的 listener。TLS 通过本模块的 `TLSConfig` 配置。
 
@@ -94,7 +114,7 @@ UDS 监听 FD 和所有权锁 FD 一起交接，旧实例退出不会删除新�
 
 | 示例 | 内容 | 验证命令 |
 | --- | --- | --- |
-| [examples/tcp](examples/tcp/main.go) | TCP 行协议、单次建连客户端 | `go run scripts/smoke_connections.go` |
+| [examples/tcp](examples/tcp/main.go) | TCP 请求按 `#` 分割、响应追加换行、单次建连客户端 | `go run scripts/smoke_connections.go` |
 | [examples/tls](examples/tls/README.md) | TLS 1.2/1.3、证书生成与校验 | `go run scripts/smoke_connections.go -example ./examples/tls` |
 | [examples/http](examples/http/main.go) | 标准 net/http、旧请求排空 | `python3 scripts/smoke_http.py` |
 
@@ -131,13 +151,13 @@ v1 自动退出，客户端输出切换到新 PID/version，计数连续增长�
 | `uds.go` | 发现旧实例、端点所有权、交接协调 |
 | `server.go` | Accept、每连接读写循环、TLS 和缓冲 |
 | `connections.go` | 暂停、连接快照、整批恢复与回退 |
-| `message.go` | Codec、业务回调与自动会话状态 |
+| `message.go` | 入站 Decoder、出站 Encoder、业务回调与自动会话状态 |
 | `protocol.go` / `fd_*.go` | 控制消息、监听清单、FD 传递及平台实现 |
 | `mtls/` | 独立 TLS 实现及 Snapshot/Restore |
 
 内部升级协调按“暂停服务 → 等待当前操作结束 → 同步快照 → 交接 → 提交或恢复”顺序执行。`sync.Mutex` 和 `sync.Cond` 统一保护暂停状态、工作计数和生命周期，连接之间不再通过 channel 请求、回复快照。网络 I/O 和业务回调仍按连接并发执行，执行期间不持有这些状态锁；`Done()` 保留对外的完成通知。
 
-- 一代内只创建一个 Manager；各代使用相同服务名称、network、请求地址和兼容的 Codec/状态格式。控制协议仅支持 v3。
+- 一代内只创建一个 Manager；各代使用相同服务名称、network、请求地址和兼容的 Decoder/Encoder/状态格式。控制协议仅支持 v3。
 - 托管 socket 仅支持 TCP。UDP 不纳入托管，其启停由业务安排。
 - 裸 `Manager.Listen / ListenWith` 只交接监听端口，已有连接由业务排空。不能仅包装任意 net.Conn 就捕获上层 bufio、标准 crypto/tls、HTTP/2 或 WebSocket 的私有状态。
 - 明文/密文缓冲上限默认且最多 256 KiB；会话序列化状态及进程级 Snapshot 各最多 1 MiB。最多 128 个业务 listener、65536 条托管连接。

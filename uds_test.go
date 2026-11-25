@@ -46,14 +46,14 @@ func TestUDSProcess(t *testing.T) {
 	if m.Inherited() && string(m.State()) != "uds-snapshot" {
 		t.Fatal("process snapshot was not restored")
 	}
-	o := ServerOptions{Codec: LineCodec(), TLSConfig: managedTLSConfig(t, uint16(version), 0), OnMessage: func(ctx context.Context, s *Session, data []byte) ([]byte, error) {
+	o := ServerOptions{Decoder: testDelimiterDecoder(t, "\n"), Encoder: testDelimiterEncoder(t, "\n"), TLSConfig: managedTLSConfig(t, uint16(version), 0), OnMessage: func(ctx context.Context, s *Session, data []byte) ([]byte, error) {
 		if s.Sequence == 1 {
 			s.Values["first"] = bytes.Clone(data)
 		}
 		return []byte(fmt.Sprintf("%d %d %s/%s", os.Getpid(), s.Sequence, s.Values["first"], data)), nil
 	}}
 	if os.Getenv("GRACEUPGRADE_UDS_MODE") == "mismatch" {
-		o.Codec = renamedCodec{Codec: o.Codec, name: "wrong/v2"}
+		o.Decoder = renamedDecoder{Decoder: o.Decoder, name: "wrong/v2"}
 	}
 	s, err := m.NewServer("uds", "tcp", "127.0.0.1:0", o)
 	if err != nil {

@@ -212,6 +212,9 @@ func (s *Server) beginWork() bool {
 func (s *Server) finishWork(c *session, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The first work item is initialization. Only after it finishes may pause
+	// interrupt I/O without failing an in-flight TLS handshake.
+	c.initialized = true
 	if err != nil {
 		// A failed step must disappear before freeze can observe an idle
 		// server, especially when TLS initialization did not finish.
@@ -294,6 +297,7 @@ type session struct {
 	handler                 *messageHandler
 	readBuffer, writeBuffer []byte
 	peerEOF                 bool
+	initialized             bool // Protected by server.mu.
 }
 
 func (c *session) run() {
@@ -327,13 +331,11 @@ func (c *session) initialize(ctx context.Context) error {
 		}
 		if c.server.options.TLSConfig != nil {
 			c.raw.SetDeadline(time.Now().Add(c.server.options.HandshakeTimeout))
-			c.transport.handshaking = true
 			c.tls = mtls.Server(c.transport, c.server.options.TLSConfig)
 			if err := c.tls.Handshake(); err != nil {
 				return err
 			}
 			c.raw.SetDeadline(time.Time{})
-			c.transport.handshaking = false
 		}
 	}
 	return nil
@@ -410,7 +412,6 @@ func (c *session) step(ctx context.Context, input []byte) error {
 		return errors.New("incomplete frame exceeds read buffer limit")
 	}
 	readInto := input[:min(len(input), space)]
-	c.raw.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	var n int
 	var err error
 	if c.tls != nil {
@@ -445,9 +446,8 @@ func (c *session) report(err error) {
 // records. WireBuffer carries the unsent ciphertext and its exact byte offset.
 type recordTransport struct {
 	net.Conn
-	pending     []byte
-	limit       int
-	handshaking bool
+	pending []byte
+	limit   int
 }
 
 func (w *recordTransport) Write(p []byte) (int, error) {
@@ -468,9 +468,6 @@ func (w *recordTransport) Read(p []byte) (int, error) {
 }
 
 func (w *recordTransport) flush() error {
-	if !w.handshaking {
-		w.Conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
-	}
 	n, err := w.Conn.Write(w.pending)
 	w.pending = w.pending[n:]
 	if err == nil && n == 0 {

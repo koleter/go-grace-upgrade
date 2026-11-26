@@ -234,6 +234,170 @@ func TestServerPauseRollbackAndClose(t *testing.T) {
 	}
 }
 
+type gatedIOConn struct {
+	net.Conn
+	started   chan struct{}
+	release   chan struct{}
+	deadlines chan time.Time
+	gateWrite bool
+}
+
+func (c *gatedIOConn) waitForRelease() {
+	select {
+	case c.started <- struct{}{}:
+	default:
+	}
+	<-c.release
+}
+
+func (c *gatedIOConn) Read(data []byte) (int, error) {
+	if !c.gateWrite {
+		c.waitForRelease()
+	}
+	return c.Conn.Read(data)
+}
+
+func (c *gatedIOConn) Write(data []byte) (int, error) {
+	if c.gateWrite {
+		c.waitForRelease()
+	}
+	return c.Conn.Write(data)
+}
+
+func (c *gatedIOConn) SetDeadline(deadline time.Time) error {
+	err := c.Conn.SetDeadline(deadline)
+	c.deadlines <- deadline
+	return err
+}
+
+func (c *gatedIOConn) SetReadDeadline(deadline time.Time) error {
+	err := c.Conn.SetReadDeadline(deadline)
+	c.deadlines <- deadline
+	return err
+}
+
+func (c *gatedIOConn) SetWriteDeadline(deadline time.Time) error {
+	err := c.Conn.SetWriteDeadline(deadline)
+	c.deadlines <- deadline
+	return err
+}
+
+func TestServerPauseInterruptsIOBeforeItBlocks(t *testing.T) {
+	for _, operation := range []string{"read", "write"} {
+		t.Run(operation, func(t *testing.T) {
+			m, err := New(testOptions(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { m.Close() })
+			s, err := m.NewServer("managed", "tcp", "127.0.0.1:0", counterOptions(t, 0, 0))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Ready(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			raw, client := net.Pipe()
+			t.Cleanup(func() { client.Close() })
+			observed := &gatedIOConn{Conn: raw, started: make(chan struct{}, 1),
+				release: make(chan struct{}), deadlines: make(chan time.Time, 32), gateWrite: operation == "write"}
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(observed.release) }) }
+			defer unblock()
+			c := s.newSession(observed, nil)
+			var pending []byte
+			if observed.gateWrite {
+				pending = []byte("pending response\n")
+				c.writeBuffer = pending
+			}
+			if !s.addSession(c) {
+				raw.Close()
+				t.Fatal("server closed before registering the connection")
+			}
+			go c.run()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			deadline, _ := ctx.Deadline()
+			client.SetDeadline(deadline)
+			waitIO := func() {
+				t.Helper()
+				select {
+				case <-observed.started:
+				case <-ctx.Done():
+					t.Fatal("connection did not start I/O:", ctx.Err())
+				}
+			}
+			waitDeadline := func() time.Time {
+				t.Helper()
+				select {
+				case deadline := <-observed.deadlines:
+					return deadline
+				case <-ctx.Done():
+					t.Fatal("connection deadline was not updated:", ctx.Err())
+					return time.Time{}
+				}
+			}
+			waitIO()
+			select {
+			case deadline := <-observed.deadlines:
+				t.Fatalf("normal I/O has a deadline: %v", deadline)
+			default:
+			}
+			for i := 0; i < 5; i++ {
+				if observed.gateWrite && i == 1 {
+					// Consume only a prefix so the next pause interrupts a partial
+					// write and must preserve exactly its unsent suffix.
+					prefix := make([]byte, 3)
+					if _, err := io.ReadFull(client, prefix); err != nil {
+						t.Fatal(err)
+					}
+					if !bytes.Equal(prefix, pending[:len(prefix)]) {
+						t.Fatalf("partial write corrupted its prefix: %q", prefix)
+					}
+					pending = pending[len(prefix):]
+				}
+				func() {
+					batch := &connectionBatch{}
+					defer batch.finish(false)
+					frozen := make(chan error, 1)
+					go func() { frozen <- m.freeze(ctx, batch) }()
+					if deadline := waitDeadline(); deadline.IsZero() || deadline.After(time.Now()) {
+						t.Fatalf("pause did not expire the I/O deadline: %v", deadline)
+					}
+					// The first pause races with I/O that has not entered the socket
+					// yet. Its deadline must remain expired when it finally blocks.
+					unblock()
+					if err := <-frozen; err != nil {
+						t.Fatal("pause did not interrupt I/O:", err)
+					}
+					if len(batch.connections) != 1 {
+						t.Fatalf("pause lost the connection: %d", len(batch.connections))
+					}
+					if got := batch.connections[0].state.WireBuffer; !bytes.Equal(got, pending) {
+						t.Fatalf("pause changed pending wire bytes: got %q, want %q", got, pending)
+					}
+				}()
+				if deadline := waitDeadline(); !deadline.IsZero() {
+					t.Fatalf("rollback did not clear the I/O deadline: %v", deadline)
+				}
+				waitIO()
+			}
+			if len(pending) > 0 {
+				remaining := make([]byte, len(pending))
+				if _, err := io.ReadFull(client, remaining); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(remaining, pending) {
+					t.Fatalf("rollback corrupted pending wire bytes: got %q, want %q", remaining, pending)
+				}
+			}
+			if _, count, text := managedExchange(t, client, "after"); count != 1 || text != "after" {
+				t.Fatalf("connection did not resume after rollback: %d %q", count, text)
+			}
+		})
+	}
+}
+
 func TestIdleServerAcceptResumesAfterRepeatedRollback(t *testing.T) {
 	m, s, first := newManaged(t, 0, 0)
 	managedExchange(t, first, "start")

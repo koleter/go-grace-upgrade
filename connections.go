@@ -92,11 +92,19 @@ func (s *Server) pauseConnections(ctx context.Context) error {
 	if s.ctx.Err() != nil {
 		return fmt.Errorf("managed server %q closed", s.name)
 	}
-	// Existing reads and writes finish concurrently; callbacks return normally.
-	// The flag prevents any loop from starting its next step.
+	// The flag prevents any loop from starting its next step. Interrupt I/O
+	// on initialized connections; TLS handshakes and callbacks finish normally.
 	s.paused = true
-	if err := s.listener.SetDeadline(time.Now()); err != nil {
+	now := time.Now()
+	if err := s.listener.SetDeadline(now); err != nil {
 		return fmt.Errorf("pause accepting on server %q: %w", s.name, err)
+	}
+	for _, c := range s.sessions {
+		if c.initialized {
+			if err := ignoreClosed(c.raw.SetDeadline(now)); err != nil {
+				return fmt.Errorf("pause I/O on server %q connection %d: %w", s.name, c.id, err)
+			}
+		}
 	}
 	for (s.accepting || s.working > 0) && ctx.Err() == nil && s.ctx.Err() == nil {
 		s.changed.Wait()
@@ -113,9 +121,14 @@ func (s *Server) pauseConnections(ctx context.Context) error {
 func (s *Server) resumeConnections() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Clear the Accept deadline before waking loops, even if Serve has not
-	// started yet. A concurrent Close may already have closed the listener.
+	// Clear deadlines before waking loops, even if Serve has not started yet.
+	// Leave in-flight TLS handshakes' own deadlines intact.
 	s.listener.SetDeadline(time.Time{})
+	for _, c := range s.sessions {
+		if c.initialized {
+			c.raw.SetDeadline(time.Time{})
+		}
+	}
 	s.paused = false
 	s.changed.Broadcast()
 }

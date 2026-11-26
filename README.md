@@ -1,21 +1,23 @@
 # go-grace-upgrade
 
-Go 服务的 UDS 热升级模块，支持 Linux / macOS，使用 Go 1.25.11。部署新版本时，直接启动使用相同 UDS 路径的新实例，框架完成资源交接，业务无需监听升级信号。
+English | [简体中文](README.zh-CN.md)
 
-- 自定义 TCP/TLS：迁移监听端口、已有连接、未消费半包、待发送数据及 TLS 1.2/1.3 状态，客户端无需重连。
-- 标准 HTTP：新实例接管监听端口，框架自动排空旧实例的请求，客户端重新建连。
-- 业务默认只提供完整消息处理函数；消息序号和 `Session.Values` 由框架自动保存、恢复。
+A UDS-based hot-upgrade module for Go services on Linux and macOS, using Go 1.25.11. Deploy a new version by starting a new instance with the same UDS path. The framework transfers resources automatically; application code does not need to listen for upgrade signals.
 
-## 接入自定义 TCP/TLS
+- Custom TCP/TLS: migrate listeners, active connections, unconsumed partial messages, pending output, and TLS 1.2/1.3 state without reconnecting clients.
+- Standard HTTP: the new instance takes over the listener, and the framework drains requests in the old instance. Clients establish new connections.
+- Application code normally only supplies a complete-message handler. The framework automatically saves and restores message sequence numbers and `Session.Values`.
+
+## Integrating custom TCP/TLS
 
 ```go
-decoder, err := graceupgrade.DelimiterDecoder("#") // 入站：按 # 拆包
+decoder, err := graceupgrade.DelimiterDecoder("#") // Inbound: split messages on #.
 if err != nil { return err }
-encoder, err := graceupgrade.DelimiterEncoder("\n") // 出站：追加换行
+encoder, err := graceupgrade.DelimiterEncoder("\n") // Outbound: append a newline.
 if err != nil { return err }
 
 manager, err := graceupgrade.New(graceupgrade.Options{
-    UpgradeSocket: "/tmp/my-service.sock", // 每一代保持相同路径，父目录须已存在
+    UpgradeSocket: "/tmp/my-service.sock", // Use the same path for every generation; the parent directory must exist.
     ReadyTimeout: 15 * time.Second,
 })
 if err != nil { return err }
@@ -23,7 +25,7 @@ defer manager.Close()
 
 server, err := manager.NewServer("service", "tcp", ":9090", graceupgrade.ServerOptions{
     Decoder: decoder,
-    Encoder: encoder, // 省略则原样发送 OnMessage 返回的字节
+    Encoder: encoder, // Omit to send the bytes returned by OnMessage unchanged.
     OnMessage: func(ctx context.Context, session *graceupgrade.Session, message []byte) ([]byte, error) {
         return []byte(fmt.Sprintf("reply-%d: %s", session.Sequence, message)), nil
     },
@@ -34,18 +36,18 @@ go server.Serve(ctx)
 if err := manager.Ready(ctx); err != nil { return err }
 
 <-manager.Done()
-// 所有托管连接已经交接，清理应用资源并返回 main。
+// All managed connections have been transferred. Clean up application resources and return from main.
 ```
 
-消息处理借鉴 [Netty Pipeline 的入站/出站分离](https://netty.io/4.1/api/io/netty/channel/ChannelPipeline.html)，流程为 `网络输入 → Decoder → OnMessage → Encoder → 网络输出`。业务分别配置收包格式、处理函数和回包格式，框架统一管理缓冲和 socket I/O。
+Message processing follows the [inbound/outbound separation in Netty Pipeline](https://netty.io/4.1/api/io/netty/channel/ChannelPipeline.html): `network input → Decoder → OnMessage → Encoder → network output`. Application code configures request framing, the handler, and response framing independently. The framework manages buffers and socket I/O.
 
-`Decoder` 和 `OnMessage` 必填，`Encoder` 可选，默认 `RawEncoder()`：直接发送业务返回的字节，不追加任何内容。例如接收 `hello#world#` 时，业务依次收到 `hello` 和 `world`；使用 `DelimiterEncoder("\n")` 时响应追加换行，省略 Encoder 时直接返回原始响应。业务也可以在 OnMessage 中组装完整回包，包括换行，然后使用默认原样发送。原样发送时，接收端需按自身协议识别响应边界。
+`Decoder` and `OnMessage` are required. `Encoder` is optional and defaults to `RawEncoder()`, which sends the returned bytes without appending anything. For example, receiving `hello#world#` delivers `hello` and `world` to the handler separately. With `DelimiterEncoder("\n")`, each response gets a trailing newline; omitting Encoder sends the raw response. The handler can also assemble the complete response, including a newline, and use the default raw encoder. When responses are sent unchanged, the receiver must identify response boundaries according to its protocol.
 
-`DelimiterDecoder(delimiter)` 按原始字节精确匹配并去掉包尾分隔符，例如 `"#"`、`"\r\n"`、`"<END>"` 或中文字符串。支持粘包和分隔符本身被拆开的半包；请求分隔符不限制响应内容，按 `#` 收包时响应可以包含 `#`。
+`DelimiterDecoder(delimiter)` matches the exact delimiter bytes and strips the trailing delimiter. Examples include `"#"`, `"\r\n"`, `"<END>"`, and Chinese strings. It handles multiple messages in one read and partial messages, including delimiters split across reads. The request delimiter does not restrict response content: responses may contain `#` even when requests are split on `#`.
 
-`DelimiterEncoder(delimiter)` 只负责出站的分隔符封装。它不执行转义：响应正文包含出站分隔符，或正文尾部与追加的分隔符形成更早的匹配时，编码返回错误，避免客户端误拆包。非 nil 空响应编码为单独的分隔符。两种分隔符构造函数都返回 `(接口, error)`，分隔符不能为空；完整包（含分隔符）不能超过 `MaxBuffer`，最多 256 KiB。
+`DelimiterEncoder(delimiter)` only frames outbound messages. It does not escape content: encoding fails if the response body contains the outbound delimiter, or if the end of the body combines with the appended delimiter to create an earlier match. This prevents clients from splitting responses incorrectly. A non-nil empty response is encoded as the delimiter alone. Both delimiter constructors return `(interface, error)` and reject empty delimiters. A complete frame, including its delimiter, must fit within `MaxBuffer`, up to 256 KiB.
 
-自定义格式只需实现所需方向的接口，分别赋给 `ServerOptions.Decoder` 和 `ServerOptions.Encoder`：
+For custom formats, implement the interface for each direction you need and assign it to `ServerOptions.Decoder` or `ServerOptions.Encoder`:
 
 ```go
 type Decoder interface {
@@ -59,23 +61,23 @@ type Encoder interface {
 }
 ```
 
-`Name()` 标识各自方向的协议格式、配置及版本，长度为 1–256 字节，在服务运行期间保持稳定。热升级同时校验 Decoder 和 Encoder，任一侧改变时拒绝恢复并回退旧实例。`Decode` 每次只返回一个完整消息及其占用的字节数，半包返回 `0, nil, nil`，不提前消费输入或保存连接私有解析状态。`Encode` 只处理响应。实例会被不同连接并发调用，方法必须并发安全，不能保存输入切片或连接私有状态。
+`Name()` identifies the format, configuration, and version for its direction. It must be 1–256 bytes long and remain stable while the service is running. Upgrades validate both Decoder and Encoder; a change on either side rejects restoration and rolls back to the old instance. Each `Decode` call returns one complete message and the number of input bytes it occupies. For incomplete input, return `0, nil, nil` without consuming input early or retaining connection-specific parser state. `Encode` only processes responses. Instances are called concurrently by different connections, so methods must be concurrency-safe and must not retain input slices or connection-specific state.
 
-长度前缀格式分别使用 `LengthPrefixDecoder(width)` 和 `LengthPrefixEncoder(width)`，支持 1/2/4/8 字节大端无符号长度，长度不包含前缀本身。各方向的构造函数独立使用，也可以搭配不同格式。按行收发使用 `DelimiterDecoder("\n")` 配合 `DelimiterEncoder("\n")`。双向协议标识不变时，会话快照保持兼容；默认 Encoder 和显式 `RawEncoder()` 也可相互恢复。
+For length-prefixed formats, use `LengthPrefixDecoder(width)` and `LengthPrefixEncoder(width)`. They support 1/2/4/8-byte unsigned big-endian lengths, excluding the prefix itself. The constructors for each direction can be used independently, including with different formats. For line-based communication, combine `DelimiterDecoder("\n")` with `DelimiterEncoder("\n")`. Session snapshots remain compatible when both protocol identifiers stay unchanged. The default Encoder and an explicit `RawEncoder()` are also mutually compatible during restoration.
 
-`OnMessage` 收到完整消息，返回响应正文，框架交给 Encoder 后发送。返回 nil 表示不响应且不调用 Encoder，非 nil 空切片仍会调用 Encoder；使用 RawEncoder 时空响应不产生网络字节。同一连接的回调串行执行；不同连接可以并行。
+`OnMessage` receives a complete message and returns a response body, which the framework passes to Encoder before sending. Returning nil skips both the response and Encoder. A non-nil empty slice still calls Encoder; with RawEncoder, an empty response produces no network bytes. Callbacks run serially within one connection and may run in parallel across connections.
 
-`Session.Sequence` 自动递增。需要保留认证用户等小量会话数据时，写入 `Session.Values`，例如 `session.Values["user"] = []byte(userID)`。不要修改 Sequence，不要在回调外访问 Session，也不要保存输入切片；需要保留时先复制。
+`Session.Sequence` increments automatically. To retain small amounts of session data, such as an authenticated user, write to `Session.Values`, for example `session.Values["user"] = []byte(userID)`. Do not modify Sequence, access Session outside the callback, or retain input slices; copy input first if you need to keep it.
 
-每连接需要迁移的业务状态应保存到 `Session.Values`，由框架统一快照和恢复；Decoder/Encoder 实例本身不会被迁移。
+Store per-connection application state that must survive upgrades in `Session.Values`. The framework snapshots and restores it automatically. Decoder/Encoder instances themselves are not migrated.
 
-原 `Factory` 接入需要将协议解码迁移到 Decoder、响应编码迁移到 Encoder、业务处理迁移到 OnMessage、会话状态迁移到 Session.Values。旧自定义 Handler 快照不能直接恢复为 Session，升级时会拒绝并回退旧实例。
+To migrate from the former `Factory` API, move protocol decoding to Decoder, response encoding to Encoder, application handling to OnMessage, and session state to Session.Values. Old custom Handler snapshots cannot be restored directly as Session snapshots; upgrades reject them and roll back to the old instance.
 
-业务需要配置 socket 选项时，可通过 `ServerOptions.Listen` 提供原始 `*net.TCPListener` 创建函数。只在冷启动时调用，升级实例会自动认领继承的 listener。TLS 通过本模块的 `TLSConfig` 配置。
+If the application needs custom socket options, provide a function that creates a raw `*net.TCPListener` through `ServerOptions.Listen`. It is called only on cold startup; upgrading instances automatically claim the inherited listener. Configure TLS through this module's `TLSConfig`.
 
-## 接入标准 HTTP
+## Integrating standard HTTP
 
-业务提供 `http.Server`，框架负责 Serve、热升级后的 Shutdown 和超时 Close，无需监听升级事件或信号：
+Supply an `http.Server`. The framework handles Serve, Shutdown after an upgrade, and Close on timeout, without application code listening for upgrade events or signals:
 
 ```go
 manager, err := graceupgrade.New(graceupgrade.Options{
@@ -92,76 +94,76 @@ if err := manager.Ready(context.Background()); err != nil { return err }
 return manager.Wait()
 ```
 
-`ServeHTTP` 在每一代的 `Ready` 前注册并启动服务；传入尚未启动的 `http.Server`，之后不要自行调用其 Serve、Shutdown 或 Close。框架只在交接提交后开始排空，升级失败时旧 HTTP 服务继续运行。`DrainTimeout` 默认 30 秒；超时会关闭剩余 HTTP 连接，并由 `Wait` 返回排空错误。
+`ServeHTTP` registers and starts the service before `Ready` in every generation. Pass an `http.Server` that has not been started, and do not subsequently call its Serve, Shutdown, or Close methods yourself. Draining starts only after the handoff is committed; if the upgrade fails, the old HTTP service keeps running. `DrainTimeout` defaults to 30 seconds. On timeout, remaining HTTP connections are closed and `Wait` returns the drain error.
 
-`Done()` 仍表示交接完成或 Manager 已关闭，HTTP 请求此时可能仍在执行；`Wait()` 会继续等待所有托管 HTTP 服务排空，并返回服务异常或排空错误。多个 HTTP 服务并行排空。宿主主动停止时调用 `manager.Close()`，然后等待 `manager.Wait()`；库不安装操作系统信号处理器，也不调用 os.Exit。HTTP 示例无需信号代码即可升级，直接 Ctrl+C/SIGTERM 停止示例使用操作系统默认行为。WebSocket 等 Hijack 连接仍需要业务单独管理。
+`Done()` still means the handoff has completed or the Manager has been closed; HTTP requests may still be running at that point. `Wait()` also waits for all managed HTTP services to drain and returns service or drain errors. Multiple HTTP services drain in parallel. To stop the host application, call `manager.Close()` and then wait for `manager.Wait()`. The library does not install operating system signal handlers or call os.Exit. The HTTP example upgrades without signal-handling code; stopping it with Ctrl+C/SIGTERM uses the operating system's default behavior. Applications must still manage hijacked connections, such as WebSockets, separately.
 
-## 升级流程
+## Upgrade flow
 
-1. `New` 连接配置的 UDS。没有旧端点时取得所有权锁并冷启动；有旧端点时必须完成协议握手。
-2. 新实例接收监听资源，初始化业务并调用 `Ready`。提交前不接收业务流量、不读写继承连接。
-3. 旧实例暂停 Accept 和连接读写，交接网络缓冲、会话及 TLS 状态；新实例整批恢复成功后才提交。
-4. 成功后旧实例关闭自己的迁移 FD 副本并关闭 `Done`。托管 HTTP 自动排空旧请求，`Wait` 返回后业务清理退出。
-5. 新实例初始化或恢复失败时中止启动，旧实例恢复服务，允许重试。
+1. `New` connects to the configured UDS. If no old endpoint exists, it acquires the ownership lock and performs a cold startup. If an old endpoint exists, the protocol handshake must succeed.
+2. The new instance receives listeners, initializes the application, and calls `Ready`. Before commit, it does not accept application traffic or read/write inherited connections.
+3. The old instance pauses Accept and connection I/O, then transfers network buffers, sessions, and TLS state. Commit happens only after the new instance successfully restores the entire batch.
+4. After a successful handoff, the old instance closes its copies of the migrated FDs and closes `Done`. Managed HTTP services automatically drain old requests. Once `Wait` returns, the application cleans up and exits.
+5. If initialization or restoration in the new instance fails, startup aborts and the old instance resumes service, allowing a retry.
 
-UDS 监听 FD 和所有权锁 FD 一起交接，旧实例退出不会删除新实例的端点。只有确认没有活跃持有者时才清理残留 socket；普通文件、权限错误、活跃端点的握手失败不会被当作冷启动。`<socket>.lock` 文件保留以稳定锁的 inode，并发接管返回 `ErrBusy`。
+The UDS listener FD and ownership lock FD are transferred together, so the old instance exiting does not remove the new instance's endpoint. Stale sockets are removed only after confirming that no active owner exists. Regular files, permission errors, and handshake failures at active endpoints are not treated as cold startups. The `<socket>.lock` file is retained to keep the lock inode stable; concurrent takeover attempts return `ErrBusy`.
 
-升级等待正在执行的回调完成；超时会回退。框架不迁移 Go 调用栈、后台任务或任意业务对象，也不会重放已经执行的回调或数据库写入。所有权提交后新实例崩溃，不会自动复活旧实例。
+Upgrades wait for running callbacks to finish and roll back on timeout. The framework does not migrate Go call stacks, background tasks, or arbitrary application objects, and it does not replay callbacks or database writes that have already executed. If the new instance crashes after ownership is committed, the old instance is not automatically revived.
 
-## 示例与验证
+## Examples and validation
 
-每个示例只演示一种接入方式，均通过直接启动新实例升级：
+Each example demonstrates one integration style. Upgrade all of them by starting a new instance directly:
 
-| 示例 | 内容 | 验证命令 |
+| Example | Contents | Validation command |
 | --- | --- | --- |
-| [examples/tcp](examples/tcp/main.go) | TCP 请求按 `#` 分割、响应追加换行、单次建连客户端 | `go run scripts/smoke_connections.go` |
-| [examples/tls](examples/tls/README.md) | TLS 1.2/1.3、证书生成与校验 | `go run scripts/smoke_connections.go -example ./examples/tls` |
-| [examples/http](examples/http/main.go) | 标准 net/http、旧请求排空 | `python3 scripts/smoke_http.py` |
+| [examples/tcp](examples/tcp/main.go) | TCP requests delimited by `#`, newline-terminated responses, and a client that connects once | `go run scripts/smoke_connections.go` |
+| [examples/tls](examples/tls/README.md) | TLS 1.2/1.3, certificate generation and verification | `go run scripts/smoke_connections.go -example ./examples/tls` |
+| [examples/http](examples/http/main.go) | Standard net/http and draining requests in the old instance | `python3 scripts/smoke_http.py` |
 
 ```bash
 go test -race -timeout=90s ./...
 go vet ./...
 ```
 
-测试覆盖 UDS 并发启动、残留端点、失败回退与重试，以及 TCP/TLS 半包、待发送明文/密文、TLS 记录碎片、exporter、多连接恢复失败。连接 smoke 会构建 v1/v2/v3，在旧进程真正退出后继续使用原连接；HTTP smoke 检查旧请求排空和持续新请求。
+Tests cover concurrent UDS startup, stale endpoints, rollback and retries, as well as TCP/TLS partial messages, pending plaintext/ciphertext, TLS record fragments, exporters, and restoration failures across multiple connections. The connection smoke test builds v1/v2/v3 and continues using the original connections after the old processes have actually exited. The HTTP smoke test checks draining of old requests and continuous handling of new requests.
 
-手动运行 TCP，在三个终端分别启动 v1、客户端和 v2：
+To try TCP manually, start v1, the client, and v2 in three separate terminals:
 
 ```bash
-# 终端一
+# Terminal 1
 go build -ldflags '-X main.version=v1' -o bin/tcp.v1 ./examples/tcp
 ./bin/tcp.v1 -addr 127.0.0.1:9090 -upgrade-socket /tmp/tcp-upgrade.sock
 
-# 终端二：只建立一次连接
+# Terminal 2: establish just one connection
 go run ./examples/tcp -mode client -addr 127.0.0.1:9090
 
-# 终端三：直接启动新版本
+# Terminal 3: start the new version directly
 go build -ldflags '-X main.version=v2' -o bin/tcp.v2 ./examples/tcp
 ./bin/tcp.v2 -addr 127.0.0.1:9090 -upgrade-socket /tmp/tcp-upgrade.sock
 ```
 
-v1 自动退出，客户端输出切换到新 PID/version，计数连续增长。各代由部署工具独立监管；停止当前实例使用其所在终端的 Ctrl+C。无需 PID 文件或升级信号。
+v1 exits automatically. Client output switches to the new PID/version while the counter continues increasing. Each generation is supervised independently by the deployment tool. Stop the current instance with Ctrl+C in its terminal. No PID file or upgrade signal is required.
 
-## 代码结构与边界
+## Code structure and limitations
 
-| 文件 | 职责 |
+| File | Responsibility |
 | --- | --- |
-| `manager.go` | New、监听注册、Ready、Done、Close 和生命周期 |
-| `http.go` | HTTP 服务托管、自动排空与 Wait |
-| `uds.go` | 发现旧实例、端点所有权、交接协调 |
-| `server.go` | Accept、每连接读写循环、TLS 和缓冲 |
-| `connections.go` | 暂停、连接快照、整批恢复与回退 |
-| `message.go` | 入站 Decoder、出站 Encoder、业务回调与自动会话状态 |
-| `protocol.go` / `fd_*.go` | 控制消息、监听清单、FD 传递及平台实现 |
-| `mtls/` | 独立 TLS 实现及 Snapshot/Restore |
+| `manager.go` | New, listener registration, Ready, Done, Close, and lifecycle management |
+| `http.go` | Managed HTTP services, automatic draining, and Wait |
+| `uds.go` | Old-instance discovery, endpoint ownership, and handoff coordination |
+| `server.go` | Accept, per-connection I/O loops, TLS, and buffers |
+| `connections.go` | Pausing, connection snapshots, batch restoration, and rollback |
+| `message.go` | Inbound Decoder, outbound Encoder, application callbacks, and automatic session state |
+| `protocol.go` / `fd_*.go` | Control messages, listener manifests, FD passing, and platform implementations |
+| `mtls/` | Independent TLS implementation and Snapshot/Restore |
 
-内部升级协调按“暂停服务 → 等待当前操作结束 → 同步快照 → 交接 → 提交或恢复”顺序执行。`sync.Mutex` 和 `sync.Cond` 统一保护暂停状态、工作计数和生命周期，连接之间不再通过 channel 请求、回复快照。网络 I/O 和业务回调仍按连接并发执行，执行期间不持有这些状态锁；`Done()` 保留对外的完成通知。
+Internal upgrade coordination follows this sequence: pause service → wait for current operations → take synchronous snapshots → transfer → commit or resume. `sync.Mutex` and `sync.Cond` protect pause state, operation counts, and lifecycle state. Connections no longer exchange snapshot requests and replies through channels. Network I/O and application callbacks still run concurrently across connections without holding these state locks; `Done()` remains the public completion notification.
 
-- 一代内只创建一个 Manager；各代使用相同服务名称、network、请求地址和兼容的 Decoder/Encoder/状态格式。控制协议仅支持 v3。
-- 托管 socket 仅支持 TCP。UDP 不纳入托管，其启停由业务安排。
-- 裸 `Manager.Listen / ListenWith` 只交接监听端口，已有连接由业务排空。不能仅包装任意 net.Conn 就捕获上层 bufio、标准 crypto/tls、HTTP/2 或 WebSocket 的私有状态。
-- 明文/密文缓冲上限默认且最多 256 KiB；会话序列化状态及进程级 Snapshot 各最多 1 MiB。最多 128 个业务 listener、65536 条托管连接。
-- TLS 迁移使用本模块 mtls，不能外包一层标准 tls.Listener。支持 TLS 1.2 AEAD/CBC 与 TLS 1.3，不迁移 TLS 1.0/1.1 或 RC4。
-- mtls 来自 MOSN 的 Go 1.12.7 TLS 分支，不会自动获得当前标准库的安全修复，需要独立维护与审查。
+- Create only one Manager per generation. All generations must use the same service names, network, requested addresses, and compatible Decoder/Encoder/state formats. Only control protocol v3 is supported.
+- Managed sockets support TCP only. Applications manage UDP startup and shutdown themselves.
+- Bare `Manager.Listen / ListenWith` transfers listeners only; applications must drain existing connections. Wrapping an arbitrary net.Conn cannot capture private state in upper layers such as bufio, standard crypto/tls, HTTP/2, or WebSocket.
+- Plaintext/ciphertext buffers default to, and cannot exceed, 256 KiB. Serialized session state and process-level Snapshot are each limited to 1 MiB. Up to 128 application listeners and 65,536 managed connections are supported.
+- TLS migration uses this module's mtls; do not wrap it in a standard tls.Listener. TLS 1.2 AEAD/CBC and TLS 1.3 are supported. TLS 1.0/1.1 and RC4 are not migrated.
+- mtls derives from MOSN's Go 1.12.7 TLS fork. It does not automatically receive security fixes from the current standard library and requires independent maintenance and review.
 
-本模块借鉴 MOSN 的 FD、网络缓冲和 TLS 迁移机制，采用整批交接，没有实现旧进程残留响应转发，详见[设计说明](docs/mosn-migration.md)。根目录 MIT 许可与 TLS 文件原有许可分别适用，见 [mtls/NOTICE](mtls/NOTICE)。
+This module draws on MOSN's FD, network-buffer, and TLS migration mechanisms and uses batch handoffs. It does not implement forwarding of residual responses from the old process. See the [design notes (Chinese)](docs/mosn-migration.md). The root MIT license and the original licenses in the TLS files apply separately; see [mtls/NOTICE](mtls/NOTICE).

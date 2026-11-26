@@ -208,11 +208,11 @@ type Session struct {
 type MessageHandler func(ctx context.Context, session *Session, message []byte) ([]byte, error)
 
 type messageHandler struct {
-	decoder   Decoder
-	encoder   Encoder
-	protocol  string
-	onMessage MessageHandler
-	state     Session
+	decoder   Decoder        // 入站解码器，把字节流切分为完整消息；由所有连接共享
+	encoder   Encoder        // 出站编码器，把回调返回的响应转换为线上字节；由所有连接共享
+	protocol  string         // 入站/出站协议标识，升级时用于校验 Decoder/Encoder 是否发生变化
+	onMessage MessageHandler // 业务回调，每条完整消息处理时调用
+	state     Session        // 连接级会话状态（序号与自定义值），随升级快照一起持久化和恢复
 }
 
 type messageState struct {

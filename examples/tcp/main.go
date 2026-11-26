@@ -2,7 +2,7 @@
 
 // A TCP service with #-delimited requests and line-delimited responses. Start a
 // new version with the same -upgrade-socket to migrate existing connections,
-// partial messages and session counts.
+// partial messages, global application data and per-connection data.
 package main
 
 import (
@@ -23,6 +23,18 @@ import (
 )
 
 var version = "dev"
+
+type globalData struct {
+	StartedAt      time.Time `json:"started_at"`
+	InitialVersion string    `json:"initial_version"`
+	UpgradeCount   uint64    `json:"upgrade_count"`
+}
+
+type connectionData struct {
+	InitialVersion string `json:"initial_version"`
+	FirstMessage   string `json:"first_message"`
+	ReceivedBytes  uint64 `json:"received_bytes"`
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -51,21 +63,51 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Global data is initialized/restored before serving, then only read by
+	// callbacks. Mutable global data would need synchronization across connections.
+	global := globalData{StartedAt: time.Now(), InitialVersion: version}
 	manager, err := graceupgrade.New(graceupgrade.Options{
-		UpgradeSocket:  *socket,
+		UpgradeSocket: *socket,
+		Snapshot: func(ctx context.Context) ([]byte, error) {
+			return json.Marshal(global)
+		},
 		OnUpgradeError: func(err error) { log.Printf("upgrade failed: %v", err) },
 	})
 	if err != nil {
 		return err
 	}
 	defer manager.Close()
+	// State contains the previous process's Snapshot output. Restore it before
+	// Ready allows inherited or new connections to run their message callbacks.
+	if state := manager.State(); len(state) > 0 {
+		if err := json.Unmarshal(state, &global); err != nil {
+			return fmt.Errorf("restore global data: %w", err)
+		}
+		global.UpgradeCount++
+	}
 	server, err := manager.NewServer("test-tcp", "tcp", *address, graceupgrade.ServerOptions{
 		Decoder: decoder,
 		Encoder: encoder,
 		OnMessage: func(ctx context.Context, session *graceupgrade.Session, message []byte) ([]byte, error) {
+			// Values is private to this connection and automatically restored on
+			// upgrade. Access it only inside OnMessage; callbacks are serialized
+			// per connection, so no lock is needed for connection data.
+			connection := connectionData{InitialVersion: version, FirstMessage: string(message)}
+			if state, ok := session.Values["connection_data"]; ok {
+				if err := json.Unmarshal(state, &connection); err != nil {
+					return nil, fmt.Errorf("restore connection data: %w", err)
+				}
+			}
+			connection.ReceivedBytes += uint64(len(message))
+			state, err := json.Marshal(connection)
+			if err != nil {
+				return nil, fmt.Errorf("save connection data: %w", err)
+			}
+			session.Values["connection_data"] = state
 			return json.Marshal(map[string]any{
 				"pid": os.Getpid(), "version": version,
 				"count": session.Sequence, "payload": string(message),
+				"global_data": global, "connection_data": connection,
 			})
 		},
 		OnError: func(err error) { log.Print(err) },

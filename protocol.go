@@ -37,10 +37,13 @@ func (i listenerInfo) validate() error {
 }
 
 type manifest struct {
-	Version       int            `json:"version"`
-	Listeners     []listenerInfo `json:"listeners"`
-	State         []byte         `json:"state,omitempty"`
-	UpgradeSocket string         `json:"upgrade_socket,omitempty"`
+	Version   int            `json:"version"`
+	Listeners []listenerInfo `json:"listeners"`
+	// State 是旧进程在交接时由 Options.Snapshot 导出的全局快照字节，随 manifest
+	// 与监听器 FD 一起传给替换进程。替换进程接收后存入 Manager.state，业务代码
+	// 通过 Manager.State() 取回并恢复；冷启动或旧进程未提供 Snapshot 时为空。
+	State         []byte `json:"state,omitempty"`
+	UpgradeSocket string `json:"upgrade_socket,omitempty"`
 }
 
 type message struct {

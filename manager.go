@@ -54,17 +54,20 @@ const (
 // Manager owns the listening sockets for a single application process.
 // A process must create only one Manager. Methods are safe for concurrent use.
 type Manager struct {
-	mu             sync.Mutex
-	listeners      map[string]*listenerRecord
-	servers        map[string]*Server
-	httpServers    map[string]*managedHTTPServer
-	changed        *sync.Cond // Uses mu; signals lifecycle changes and HTTP failures.
-	control        *net.UnixConn
-	state          []byte
-	phase          managerPhase // Lifecycle, protected by mu; state holds application data.
-	timeout        time.Duration
-	upgradeSocket  string
-	endpoint       *upgradeEndpoint
+	mu            sync.Mutex
+	listeners     map[string]*listenerRecord
+	servers       map[string]*Server
+	httpServers   map[string]*managedHTTPServer
+	changed       *sync.Cond // Uses mu; signals lifecycle changes and HTTP failures.
+	control       *net.UnixConn
+	state         []byte
+	phase         managerPhase // Lifecycle, protected by mu; state holds application data.
+	timeout       time.Duration
+	upgradeSocket string
+	endpoint      *upgradeEndpoint
+	// snapshot is a copy of Options.Snapshot; it is called only by the outgoing
+	// owner during a startup-driven upgrade to export process-wide state, which
+	// travels with the listener FDs and is readable via State in the replacement.
 	snapshot       func(context.Context) ([]byte, error)
 	onUpgradeError func(error)
 	done           chan struct{}
@@ -79,7 +82,7 @@ func New(options Options) (*Manager, error) {
 		return nil, errors.New("graceupgrade: ReadyTimeout must not be negative")
 	}
 	if options.ReadyTimeout == 0 {
-		options.ReadyTimeout = 30 * time.Second
+		options.ReadyTimeout = 300000 * time.Second
 	}
 	if options.UpgradeSocket == "" {
 		return nil, errors.New("graceupgrade: UpgradeSocket is required")
